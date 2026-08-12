@@ -1498,6 +1498,11 @@ class GatewayTurnMixin:
         await self.hooks.emit("agent:end", {
             **hook_ctx, "response": (response or "")[:500], "model": agent_result.get("model", ""),
             "provider": agent_result.get("provider", ""),
+            # Lifecycle consumers must distinguish an ordinary final from a provider/auth failure
+            # that merely returned user-facing error text. Without this, status hooks can preserve
+            # phantom WORKING cards after a failed turn. (local patch, upstream PR #96420)
+            "failed": bool(agent_result.get("failed")),
+            "completed": bool(agent_result.get("completed")),
         })
 
         # Pending process watchers (check_interval on background processes)
