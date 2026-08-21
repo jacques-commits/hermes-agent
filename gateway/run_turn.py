@@ -2196,6 +2196,20 @@ class GatewayTurnMixin:
                     fallback_model=self._refresh_fallback_model(),
                 )
                 try:
+                    # `/background` sessions used to persist with no chat/thread origin, so durable
+                    # consumers could see the bg_* transcript but could not attribute it to the
+                    # originating topic. Record the same gateway peer metadata as a normal turn before
+                    # execution. The recorder self-heals a missing session row and does not link this
+                    # task into the active foreground routing map. (local patch, upstream PR #96421)
+                    try:
+                        recorder = getattr(self.session_store, "_record_gateway_session_peer", None)
+                        if callable(recorder):
+                            recorder(
+                                task_id, self._session_key_for_source(source), source,
+                                display_name="Background task",
+                            )
+                    except Exception as exc:
+                        logger.debug("Background task %s origin persistence failed: %s", task_id, exc)
                     return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)
                 finally:
                     self._cleanup_agent_resources(agent)
