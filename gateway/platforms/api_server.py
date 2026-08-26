@@ -3928,11 +3928,33 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # while both report success — disable. - Linux: SO_REUSEADDR only permits rebinding past
             # TIME_WAIT (a second live listener needs SO_REUSEPORT, never set), so keep the default
             # (enabled) for instant restart rebinds.
-            self._site = web.TCPSite(
-                self._runner, self._host, self._port, reuse_address=False if sys.platform == "darwin" else None)
-            try:
-                await self._site.start()
-            except OSError as exc:
+            # Local patch (upstream PR #96419): across a gateway restart the predecessor's socket
+            # can linger for a few seconds (kickstart -k gives no gap; reuse_address is deliberately
+            # OFF on macOS above). A single bind attempt turned that handoff race into a dead API
+            # port until the NEXT restart (observed on 3 of 4 restarts, 2026-08-25/26). Retry
+            # EADDRINUSE briefly before declaring the fatal config error — the genuinely-held-port
+            # case (#52132) still goes fatal, just ~30s later.
+            bind_exc = None
+            for _bind_attempt in range(10):
+                self._site = web.TCPSite(
+                    self._runner, self._host, self._port, reuse_address=False if sys.platform == "darwin" else None)
+                try:
+                    await self._site.start()
+                    bind_exc = None
+                    break
+                except OSError as exc:
+                    bind_exc = exc
+                    self._site = None
+                    if getattr(exc, "errno", None) != errno.EADDRINUSE:
+                        break
+                    if _bind_attempt < 9:
+                        logger.warning(
+                            "[%s] bind %s:%d busy (attempt %d/10) — predecessor socket may be "
+                            "lingering; retrying in 3s",
+                            self.name, self._host, self._port, _bind_attempt + 1)
+                        await asyncio.sleep(3.0)
+            if bind_exc is not None:
+                exc = bind_exc
                 await self._runner.cleanup()
                 self._runner = None
                 self._site = None
