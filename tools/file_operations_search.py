@@ -586,6 +586,12 @@ class SearchMixin:
         rg = self._quote_executable(rg_executable)
         has_meta = bool(re.search(r"[.\[\](){}?*+^$\\|]", pattern))
         glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
+        # Apply the same macOS TCC-protected exclusions the main engines use. The probes re-scan
+        # the root — the hidden probe even with --hidden --no-ignore — so without this a
+        # ZERO-RESULT broad search still descends into protected app data and fires the
+        # unattended prompt the primary exclusion just avoided. (local patch, upstream PR #96405)
+        for _item in self._macos_search_exclusions(path):
+            glob_expr += f" --glob {self._escape_shell_arg(f'!{_item}/**')}"
         for flags, template in self._ZERO_MATCH_PROBES:
             if flags == "-F" and not has_meta:
                 continue
