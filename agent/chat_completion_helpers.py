@@ -2165,8 +2165,19 @@ def cleanup_task_resources(agent, task_id: str) -> None:
         except Exception:
             return bool(os.environ.get("AGENT_BROWSER_HEADED"))
 
+    def _finalize_browser_tabs() -> None:
+        # Ownership-aware tab lifecycle: close only the tabs this turn (or task) leased.
+        from tools.browser_tool import finalize_browser_tab_lifecycle
+
+        owner_key = getattr(agent, "_current_turn_id", "") or task_id
+        report = finalize_browser_tab_lifecycle(owner_key)
+        if report.get("failed") and agent.verbose_logging:
+            logger.warning("Failed to finalize %s browser tab lease(s) for turn %s: %s",
+                           report.get("failed"), owner_key, report.get("errors"))
+
     for label, skip, skip_what, cleanup in (
         ("VM", is_persistent_env, "cleanup_vm for persistent env", lambda: _ra().cleanup_vm(task_id)),
+        ("browser tabs", lambda _tid: False, "", _finalize_browser_tabs),
         ("browser", lambda _tid: _headed(), "cleanup_browser for headed session", lambda: _ra().cleanup_browser(task_id)),
     ):
         try:

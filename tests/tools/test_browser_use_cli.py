@@ -1265,9 +1265,35 @@ class TestLightpandaPreamble:
         assert "_hermes_ensure_own_tab" not in result["output"]
         assert "print('payload')" in result["output"]
 
+    def test_lightpanda_skips_tab_lifecycle_even_when_enabled(self, tmp_path, monkeypatch):
+        import tools.browser_tool as bt
+
+        monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: None)
+        monkeypatch.setattr("tools.browser_tool_lightpanda_fallback._using_lightpanda_engine", lambda: True)
+        monkeypatch.setattr(
+            bt_session, "_get_session_info", lambda key: {"cdp_url": "http://127.0.0.1:43111"}
+        )
+        monkeypatch.setattr(bu_cli, "_resource_hygiene_enabled", lambda: True)
+        lifecycle_calls = []
+        monkeypatch.setattr(
+            bt, "prepare_browser_tab_lifecycle",
+            lambda **kwargs: lifecycle_calls.append(kwargs) or (None, None),
+        )
+        cli = _fake_cli(tmp_path, "cat\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        raw = bu_cli.browser_exec("print('payload')", session="r7k2")
+        assert isinstance(raw, str)
+        result = json.loads(raw)
+
+        assert result["success"] is True
+        assert lifecycle_calls == []
+
 
 class TestLightpandaHeader:
     def test_lightpanda_header_is_text_first_even_for_vision_models(self, monkeypatch):
+        monkeypatch.setattr(bu_cli, "_resource_hygiene_enabled", lambda: True)
         monkeypatch.setattr(
             "tools.vision_tools._should_use_native_vision_fast_path", lambda: True
         )
@@ -1279,6 +1305,7 @@ class TestLightpandaHeader:
         assert header.endswith(bu_cli._HEADER_LIGHTPANDA)
         assert "goto_url(url)" in header
         assert "attached to your context automatically" not in header
+        assert "TAB LIFECYCLE" not in header
         overrides = bu_cli._dynamic_schema_overrides()
         assert overrides["description"].startswith(bu_cli._HEADER_BASE)
         assert overrides["description"].endswith(bu_cli._HELPERS_DIGEST)
@@ -1421,3 +1448,128 @@ class TestTimeoutProcessGroupKill:
         monkeypatch.setattr(bu_cli, "_kill_cli_process_group", lambda proc: None)
         with pytest.raises(subprocess.TimeoutExpired):
             bu_cli._run_cli_killing_process_group(["x"], "code", {}, 5)
+
+
+class TestBrowserResourceHygiene:
+    class FakeGuard:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.target_id = "owned-target"
+            self.started = False
+            self.finished = False
+            type(self).instances.append(self)
+
+        def start(self):
+            self.started = True
+            return None
+
+        def finish(self):
+            self.finished = True
+            return {
+                "managed": True,
+                "ok": True,
+                "created": 1,
+                "repurposed": 0,
+                "closed": 1,
+                "leased": 0,
+                "remaining_pages": 1,
+                "errors": [],
+            }
+
+    @pytest.fixture(autouse=True)
+    def _guard(self, monkeypatch):
+        import tools.browser_tool as browser_tool
+
+        self.FakeGuard.instances = []
+
+        def fake_prepare(**kwargs):
+            if kwargs.get("private_browser"):
+                return None, None
+            guard = self.FakeGuard(**kwargs)
+            return guard, guard.start()
+
+        monkeypatch.setattr(browser_tool, "prepare_browser_tab_lifecycle", fake_prepare)
+        monkeypatch.setattr(bu_cli, "_resource_hygiene_enabled", lambda: True)
+        monkeypatch.setattr(
+            bu_cli,
+            "_base_subprocess_env",
+            lambda: {"BU_CDP_URL": "http://127.0.0.1:9222"},
+        )
+        monkeypatch.setattr(bu_cli, "_resolve_backend_cdp", lambda env, task_id, **kw: None)
+
+    def test_schema_exposes_explicit_bounded_lease(self):
+        properties = bu_cli.BROWSER_EXEC_SCHEMA["parameters"]["properties"]
+        assert properties["lease_minutes"]["minimum"] == 0
+        assert properties["lease_minutes"]["maximum"] == 120
+        assert "lease_reason" in properties
+
+    def test_canonical_config_declares_tab_lifecycle_default(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["browser"]["resource_hygiene"] == {"enabled": False}
+
+    def test_lease_requires_reason_before_browser_execution(self, tmp_path, monkeypatch):
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "should-not-run"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        raw = bu_cli.browser_exec("print(1)", lease_minutes=10)
+        assert isinstance(raw, str)
+        result = json.loads(raw)
+        assert "lease_reason is required" in result["error"]
+        assert not self.FakeGuard.instances
+
+    def test_managed_local_call_starts_and_finishes_guard(self, tmp_path, monkeypatch):
+        cli = _fake_cli(tmp_path, 'cat\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        raw = bu_cli.browser_exec(
+            "print(1)",
+            task_id="task-123",
+            turn_id="turn-456",
+            lease_minutes=15,
+            lease_reason="continue pagination",
+        )
+        assert isinstance(raw, str)
+        result = json.loads(raw)
+        guard = self.FakeGuard.instances[0]
+        assert guard.started is True
+        assert guard.finished is True
+        assert guard.kwargs["owner_key"] == "turn-456"
+        assert guard.kwargs["lease_minutes"] == 15
+        assert 'switch_tab("owned-target")' in result["output"]
+        assert result["hygiene"]["closed"] == 1
+
+    def test_timeout_still_finishes_guard(self, tmp_path, monkeypatch):
+        cli = _fake_cli(tmp_path, "cat > /dev/null\nsleep 30\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(bu_cli, "_MIN_TIMEOUT_S", 1)
+        raw = bu_cli.browser_exec("print(1)", timeout_s=1)
+        assert isinstance(raw, str)
+        result = json.loads(raw)
+        assert "timed out" in result["error"]
+        assert self.FakeGuard.instances[0].finished is True
+
+    def test_named_shared_local_session_is_managed(self, tmp_path, monkeypatch):
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "local"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        raw = bu_cli.browser_exec("print(1)", session="local-a")
+        assert isinstance(raw, str)
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert len(self.FakeGuard.instances) == 1
+        assert self.FakeGuard.instances[0].kwargs["session_name"] == "local-a"
+
+    def test_named_private_cloud_session_is_never_managed(self, tmp_path, monkeypatch):
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "cloud"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        def mark_private(env, task_id, **kwargs):
+            env[bu_cli._PRIVATE_BROWSER_SENTINEL] = "1"
+            return None
+
+        monkeypatch.setattr(bu_cli, "_resolve_backend_cdp", mark_private)
+        raw = bu_cli.browser_exec("print(1)", session="cloud-a")
+        assert isinstance(raw, str)
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert not self.FakeGuard.instances

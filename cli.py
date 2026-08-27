@@ -392,6 +392,7 @@ def _cli_config_defaults():
         },
         "browser": {
             "inactivity_timeout": 120, "record_sessions": False, "engine": "auto",  # auto (Chrome) | lightpanda | chrome
+            "resource_hygiene": {"enabled": False},  # close only locally owned Browser Use tabs after each call
             "camofox": {"rewrite_loopback_urls": False, "loopback_host_alias": "host.docker.internal"},
         },
         # threshold: fraction of the model's context limit; min_tail: real user messages kept in the tail

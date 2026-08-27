@@ -178,6 +178,9 @@ def _cleanup_inactive_browser_sessions():
             finally:
                 _forget_session_tracking(task_id, activity=False)
 
+    # Bounded tab leases (browser.resource_hygiene) expire independently of session inactivity.
+    _bt.reap_expired_browser_tab_lifecycles()
+
 
 def _write_owner_pid(socket_dir: str, session_name: str) -> None:
     """Record this hermes PID in ``<socket_dir>/<session>.owner_pid`` so the orphan
