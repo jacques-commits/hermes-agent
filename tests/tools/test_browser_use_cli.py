@@ -16,7 +16,9 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -639,6 +641,207 @@ class TestOwnTabPreamble:
         ast.parse(bu_cli._OWN_TAB_PREAMBLE)
         # and composes with model code
         ast.parse(bu_cli._OWN_TAB_PREAMBLE + "print('x')")
+
+    def test_preamble_reselects_existing_logical_tab_every_call(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BH_RUNTIME_DIR", str(tmp_path))
+        monkeypatch.setenv("HERMES_BU_LOGICAL_SESSION", "research")
+        targets, created, switched = {}, [], []
+
+        def fake_cdp(method, **kwargs):
+            if method == "Target.getTargets":
+                return {"targetInfos": list(targets.values())}
+            target_id = f"target-{len(created) + 1}"
+            targets[target_id] = {"targetId": target_id, "type": "page"}
+            created.append(target_id)
+            return {"targetId": target_id}
+
+        for _ in range(2):
+            exec(bu_cli._OWN_TAB_PREAMBLE, {"cdp": fake_cdp, "switch_tab": switched.append})
+        assert created == ["target-1"]
+        assert switched == ["target-1", "target-1"]
+
+
+class TestSessionScopedTransport:
+    def test_lineage_reuses_runtime_across_logical_names_and_compression(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        env1, env2 = {}, {}
+        one = bu_cli._configure_session_transport(env1, conversation_id="root", logical_session="a", private_browser=False)
+        two = bu_cli._configure_session_transport(env2, conversation_id="root", logical_session="b", private_browser=False)
+        assert one is not None and two is not None
+        assert one.key == two.key
+        assert env1["BH_RUNTIME_DIR"] == env2["BH_RUNTIME_DIR"]
+        assert env1["HERMES_BU_LOGICAL_SESSION"] == "a"
+        assert env2["HERMES_BU_LOGICAL_SESSION"] == "b"
+
+    def test_different_lineage_endpoint_or_profile_gets_different_transport(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-a"))
+        a = bu_cli._configure_session_transport({}, conversation_id="root-a", logical_session="x", private_browser=False)
+        b = bu_cli._configure_session_transport({}, conversation_id="root-b", logical_session="x", private_browser=False)
+        c = bu_cli._configure_session_transport({"BU_CDP_WS": "ws://127.0.0.1:9/other"}, conversation_id="root-a", logical_session="x", private_browser=False)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-b"))
+        d = bu_cli._configure_session_transport({}, conversation_id="root-a", logical_session="x", private_browser=False)
+        assert a is not None and b is not None and c is not None and d is not None
+        assert len({a.key, b.key, c.key, d.key}) == 4
+
+    def test_private_browser_is_not_multiplexed(self):
+        env = {}
+        assert bu_cli._configure_session_transport(env, conversation_id="root", logical_session="x", private_browser=True) is None
+        assert "BH_RUNTIME_DIR" not in env
+
+    @pytest.mark.skipif(os.name == "nt", reason="AF_UNIX path applies on POSIX")
+    def test_runtime_socket_path_stays_under_macos_limit(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ("very-long-" * 20)))
+        info = bu_cli._configure_session_transport({}, conversation_id="root", logical_session="x", private_browser=False)
+        assert info is not None
+        assert len(os.fsencode(str(info.runtime_dir / "bu.sock"))) < 100
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX flock integration")
+    def test_transport_file_lock_serializes_processes(self, tmp_path):
+        runtime = tmp_path / "run"
+        scratch = tmp_path / "tmp"
+        runtime.mkdir(); scratch.mkdir()
+        output = tmp_path / "order.log"
+        script = tmp_path / "lock_probe.py"
+        script.write_text(
+            "import sys, threading, time\n"
+            "from pathlib import Path\n"
+            "from tools.browser_use_cli import _SessionTransport, _TransportExecutionLock\n"
+            "t=_SessionTransport('key', Path(sys.argv[2]), Path(sys.argv[3]), threading.RLock())\n"
+            "lock=_TransportExecutionLock(t, 5); lock.acquire()\n"
+            "with open(sys.argv[4], 'a', encoding='utf-8') as f: f.write('start '+sys.argv[1]+'\\n')\n"
+            "time.sleep(.2)\n"
+            "with open(sys.argv[4], 'a', encoding='utf-8') as f: f.write('end '+sys.argv[1]+'\\n')\n"
+            "lock.release()\n",
+            encoding="utf-8",
+        )
+        args = [str(runtime), str(scratch), str(output)]
+        repo_root = str(Path(__file__).resolve().parents[2])
+        child_env = dict(os.environ)
+        child_env["PYTHONPATH"] = repo_root + (
+            os.pathsep + child_env["PYTHONPATH"]
+            if child_env.get("PYTHONPATH")
+            else ""
+        )
+        first = subprocess.Popen(
+            [sys.executable, str(script), "a", *args],
+            cwd=repo_root,
+            env=child_env,
+        )
+        second = subprocess.Popen(
+            [sys.executable, str(script), "b", *args],
+            cwd=repo_root,
+            env=child_env,
+        )
+        assert first.wait(timeout=10) == 0
+        assert second.wait(timeout=10) == 0
+        lines = output.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 4
+        assert lines[0].split()[1] == lines[1].split()[1]
+        assert lines[2].split()[1] == lines[3].split()[1]
+        assert lines[0].split()[1] != lines[2].split()[1]
+
+    def test_registry_forwards_conversation_lineage(self, monkeypatch):
+        from tools.registry import registry
+        captured = {}
+        monkeypatch.setattr(bu_cli, "browser_exec", lambda **kw: captured.update(kw) or "ok")
+        entry = registry.get_entry("browser_exec")
+        assert entry is not None
+        assert entry.handler({"code": "print(1)"}, session_id="child", conversation_id="root") == "ok"
+        assert captured["conversation_id"] == "root"
+
+    def test_fake_daemon_reports_attach_reuse_and_drop_reconnect(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        # A SHARED desktop Chrome (persistent CDP endpoint): the per-conversation transport only applies
+        # there. The packaged per-cache-key Chromium is private and never multiplexed.
+        monkeypatch.setenv("BROWSER_CDP_URL", "ws://127.0.0.1:9/devtools/browser/shared-desktop")
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\nif [ ! -f "$BH_RUNTIME_DIR/alive" ]; then n=$(($(cat "$BH_RUNTIME_DIR/n" 2>/dev/null || echo 0)+1)); echo "$n" > "$BH_RUNTIME_DIR/n"; echo "$n" > "$BH_RUNTIME_DIR/bu.pid"; touch "$BH_RUNTIME_DIR/alive"; fi\necho "runtime:$BH_RUNTIME_DIR"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(
+            bu_cli,
+            "_probe_daemon_pid",
+            lambda runtime: (
+                int((runtime / "bu.pid").read_text(encoding="utf-8"))
+                if (runtime / "alive").exists() and (runtime / "bu.pid").exists()
+                else None
+            ),
+        )
+        raw1 = bu_cli.browser_exec("print(1)", session="a", conversation_id="root")
+        raw2 = bu_cli.browser_exec("print(2)", session="b", conversation_id="root")
+        assert isinstance(raw1, str) and isinstance(raw2, str)
+        one, two = json.loads(raw1), json.loads(raw2)
+        assert one["cdp_transport"]["attach_count"] == 1
+        assert two["cdp_transport"]["attach_count"] == 1
+        assert two["cdp_transport"]["reused"] is True
+        runtime = Path(one["output"].split("runtime:", 1)[1].strip())
+        (runtime / "alive").unlink(); (runtime / "bu.pid").unlink()
+        raw3 = bu_cli.browser_exec("print(3)", session="a", conversation_id="root")
+        assert isinstance(raw3, str)
+        three = json.loads(raw3)
+        assert three["cdp_transport"]["attach_count"] == 2
+        assert three["cdp_transport"]["attached_this_call"] == 1
+
+    def test_daemon_identity_requires_live_ping_matching_pid_file(
+        self, tmp_path, monkeypatch
+    ):
+        runtime = tmp_path / "run"
+        runtime.mkdir()
+        (runtime / "bu.pid").write_text("123", encoding="utf-8")
+
+        monkeypatch.setattr(bu_cli, "_probe_daemon_pid", lambda _runtime: None)
+        assert bu_cli._daemon_identity(runtime) is None
+
+        monkeypatch.setattr(bu_cli, "_probe_daemon_pid", lambda _runtime: 124)
+        assert bu_cli._daemon_identity(runtime) is None
+
+        monkeypatch.setattr(bu_cli, "_probe_daemon_pid", lambda _runtime: 123)
+        assert bu_cli._daemon_identity(runtime) is not None
+
+    def test_permission_failure_counts_attempt_not_attach_success(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        info = bu_cli._configure_session_transport(
+            {}, conversation_id="root", logical_session="a", private_browser=False
+        )
+        assert info is not None
+
+        report = bu_cli._record_transport_outcome(
+            info,
+            None,
+            None,
+            "a",
+            False,
+            "permission-blocked: Allow remote debugging? was not accepted",
+        )
+
+        assert report["attach_count"] == 1
+        assert report["attach_success_count"] == 0
+        assert report["attached_this_call"] == 1
+        assert report["reused"] is False
+        telemetry = json.loads(
+            (info.tmp_dir / "transport-telemetry.json").read_text(encoding="utf-8")
+        )
+        assert telemetry["events"][-1]["event"] == "attach_failed"
+        assert telemetry["events"][-1]["reason"] == "permission_blocked"
+
+    def test_telemetry_never_persists_endpoint_or_raw_session_ids(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        endpoint = "ws://127.0.0.1:9/devtools/browser/SECRET-ENDPOINT"
+        env = {"BU_CDP_WS": endpoint}
+        info = bu_cli._configure_session_transport(
+            env, conversation_id="SECRET-LINEAGE", logical_session="SECRET-LOGICAL",
+            private_browser=False,
+        )
+        assert info is not None
+        bu_cli._record_transport_outcome(
+            info, None, "hashed-daemon", "SECRET-LOGICAL", True, ""
+        )
+        persisted = (info.tmp_dir / "transport-telemetry.json").read_text(
+            encoding="utf-8"
+        )
+        assert "SECRET-ENDPOINT" not in persisted
+        assert "SECRET-LINEAGE" not in persisted
+        assert "SECRET-LOGICAL" not in persisted
 
 
 class TestProviderPickerIntegration:
@@ -1548,6 +1751,41 @@ class TestBrowserResourceHygiene:
         result = json.loads(raw)
         assert "timed out" in result["error"]
         assert self.FakeGuard.instances[0].finished is True
+
+    def test_finish_exception_never_wedges_transport_lock(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "ok"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        def finish_boom(_guard):
+            raise RuntimeError("finish boom")
+
+        monkeypatch.setattr(self.FakeGuard, "finish", finish_boom)
+        with pytest.raises(RuntimeError, match="finish boom"):
+            bu_cli.browser_exec("print(1)", conversation_id="lineage-root")
+
+        info = bu_cli._configure_session_transport(
+            {"BU_CDP_URL": "http://127.0.0.1:9222"},
+            conversation_id="lineage-root",
+            logical_session="default",
+            private_browser=False,
+        )
+        assert info is not None
+        acquired = []
+
+        def acquire_from_another_thread():
+            lock = bu_cli._TransportExecutionLock(info, 0.2)
+            try:
+                lock.acquire()
+                acquired.append(True)
+            finally:
+                lock.release()
+
+        thread = threading.Thread(target=acquire_from_another_thread)
+        thread.start()
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+        assert acquired == [True]
 
     def test_named_shared_local_session_is_managed(self, tmp_path, monkeypatch):
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "local"\n')

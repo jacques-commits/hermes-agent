@@ -5,6 +5,7 @@ instead of default browser tools
 """
 
 import contextlib
+import hashlib
 import importlib
 import json
 import logging
@@ -12,8 +13,12 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
+import tempfile
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -32,41 +37,49 @@ _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # (per-name provider / named BU cloud / Lightpanda). Popped before the subprocess launches — never exported.
 _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
 
-# Prepended to the model's code for named sessions on SHARED browsers (a /browser connect CDP override): the
-# harness daemon attaches to the first existing page at startup, so two fresh named daemons can land on the
-# SAME tab. Steering each onto a tab it created prevents clobbering. Runs once per daemon (marker keyed by
-# BU_NAME + daemon pid).
+# Prepended to the model's code for logical sessions on a SHARED physical daemon (a /browser connect CDP
+# override, or the per-conversation transport below): the daemon attaches to the first existing page at
+# startup, and another logical session may have changed its current tab since. Each call therefore reselects
+# this logical session's own tab (slot file keyed by HERMES_BU_LOGICAL_SESSION under the harness runtime dir),
+# creating a fresh target only when the recorded one is gone.
 _OWN_TAB_PREAMBLE = """\
-# hermes: pin this named session to its own tab (once per daemon process)
+# hermes: select this logical session's tab on the shared CDP transport
 def _hermes_ensure_own_tab():
-    import os as _os, tempfile as _tf
-    _name = _os.environ.get("BU_NAME", "default")
+    import hashlib as _hashlib, json as _json, os as _os, tempfile as _tf
+    _name = _os.environ.get("HERMES_BU_LOGICAL_SESSION") or _os.environ.get("BU_NAME", "default")
+    _runtime = _os.environ.get("BH_RUNTIME_DIR") or _tf.gettempdir()
+    _slot = _os.path.join(_runtime, "hermes-tab-%s.json" % _hashlib.sha256(_name.encode()).hexdigest()[:20])
+    _tid = None
     try:
-        # Key the marker by the daemon's pid so a daemon restart (which
-        # re-attaches to the first shared page) re-pins automatically,
-        # while agent-driven tab switches mid-session are left alone.
-        from browser_harness import _ipc as _bipc
-        _dpid = _bipc.pid_path(_name).read_text().strip() or "0"
+        with open(_slot, "r", encoding="utf-8") as _fh:
+            _tid = _json.load(_fh).get("target_id")
     except Exception:
-        _dpid = "0"
-    _uid = _os.getuid() if hasattr(_os, "getuid") else 0
-    _marker = _os.path.join(
-        _tf.gettempdir(), "hermes-bu-owntab-%s-%s-%s" % (_uid, _name, _dpid)
-    )
-    if _os.path.exists(_marker):
-        return
-    try:
-        # Force a fresh target: new_tab() would REUSE a blank current tab,
-        # which is exactly the tab a sibling daemon may also hold.
-        _tid = cdp("Target.createTarget", url="about:blank").get("targetId")
-        if _tid:
-            switch_tab(_tid)
-    except Exception:
-        pass  # best-effort: worst case is pre-fix behavior
-    try:
-        open(_marker, "w").close()
-    except OSError:
         pass
+    try:
+        _live = {t.get("targetId") for t in cdp("Target.getTargets").get("targetInfos", []) if t.get("type") == "page"}
+    except Exception:
+        _live = set()
+    if _tid not in _live:
+        try:
+            # Force a fresh target: new_tab() would REUSE a blank current tab,
+            # which is exactly the tab a sibling session may also hold.
+            _tid = cdp("Target.createTarget", url="about:blank").get("targetId")
+        except Exception:
+            _tid = None
+        if _tid:
+            try:
+                _os.makedirs(_runtime, mode=0o700, exist_ok=True)
+                _fd, _tmp = _tf.mkstemp(prefix=".hermes-tab-", dir=_runtime)
+                with _os.fdopen(_fd, "w", encoding="utf-8") as _fh:
+                    _json.dump({"target_id": _tid}, _fh)
+                _os.replace(_tmp, _slot)
+            except OSError:
+                pass
+    if _tid:
+        try:
+            switch_tab(_tid)
+        except Exception:
+            pass  # best-effort: worst case is pre-fix behavior
 _hermes_ensure_own_tab()
 del _hermes_ensure_own_tab
 """
@@ -83,6 +96,234 @@ _IMAGE_PATH_RE = re.compile(r"((?:[A-Za-z]:[\\/]|/)[^\s\"']+?\.(?:png|jpe?g|webp
 # http(s) URL literals in exec code checked against browser_navigate's policy
 _URL_RE = re.compile(r"https?://[^\s'\"\\)]+", re.IGNORECASE)
 _FHS_BIN_DIRS = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows
+    _fcntl = None
+
+try:
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    _msvcrt = None
+
+
+# ---------------------------------------------------------------------------
+# Per-conversation desktop CDP transport: one browser-harness daemon per (profile, conversation lineage,
+# endpoint) so a shared desktop Chrome is attached ONCE per conversation instead of per tool call
+# (each fresh attach re-prompts Chrome's "Allow remote debugging?"). Logical sessions (BU_NAME) multiplex it.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _SessionTransport:
+    key: str
+    runtime_dir: Path
+    tmp_dir: Path
+    thread_lock: threading.RLock
+
+
+_TRANSPORT_LOCK_GUARD = threading.Lock()
+_TRANSPORT_THREAD_LOCKS: Dict[str, threading.RLock] = {}
+
+
+def _private_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        path.chmod(0o700)
+    return path
+
+
+def _configure_session_transport(env: dict, *, conversation_id: str, logical_session: str,
+                                 private_browser: bool) -> Optional[_SessionTransport]:
+    """One browser-harness daemon per profile, conversation lineage, endpoint (exported via BH_RUNTIME_DIR /
+    BH_TMP_DIR / HERMES_BU_LOGICAL_SESSION). ``None`` without a lineage scope or for private browsers."""
+    scope = str(conversation_id or "").strip()
+    if not scope or private_browser:
+        return None
+    try:
+        home = Path(get_hermes_home()).expanduser().resolve()
+    except Exception:
+        return None
+    endpoint = str(env.get("BU_CDP_URL") or env.get("BU_CDP_WS") or "local-auto")
+    key = hashlib.sha256(f"{home}\0{scope}\0{endpoint}".encode()).hexdigest()[:24]
+    tmp_dir = _private_dir(home / "cache" / "bu" / key / "tmp")
+    if os.name == "nt":
+        runtime_dir = _private_dir(home / "cache" / "bu" / key / "run")
+    else:
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        runtime_dir = _private_dir(Path(tempfile.gettempdir()) / f"hermes-bu-{uid}" / key)
+        if len(os.fsencode(str(runtime_dir / "bu.sock"))) >= 100:  # AF_UNIX sun_path limit (macOS 104)
+            runtime_dir = _private_dir(Path("/tmp") / f"hermes-bu-{uid}" / key)
+    env["BH_RUNTIME_DIR"] = str(runtime_dir)
+    env["BH_TMP_DIR"] = str(tmp_dir)
+    env["HERMES_BU_LOGICAL_SESSION"] = str(logical_session or "default")
+    with _TRANSPORT_LOCK_GUARD:
+        lock = _TRANSPORT_THREAD_LOCKS.setdefault(key, threading.RLock())
+    return _SessionTransport(key, runtime_dir, tmp_dir, lock)
+
+
+class _TransportExecutionLock:
+    """Thread + cross-process lock for one daemon's mutable current target."""
+
+    def __init__(self, transport: _SessionTransport, timeout_s: float):
+        self.transport = transport
+        self.timeout_s = max(0.1, float(timeout_s))
+        self.handle = None
+        self.thread_held = False
+
+    def _wait_locked(self, try_lock: Callable[[], None], busy: type, deadline: float) -> None:
+        while True:
+            try:
+                try_lock()
+                return
+            except busy:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("another process owns this browser CDP transport")
+                time.sleep(0.05)
+
+    def acquire(self) -> None:
+        deadline = time.monotonic() + self.timeout_s
+        if not self.transport.thread_lock.acquire(timeout=self.timeout_s):
+            raise TimeoutError("another browser_exec call owns this CDP transport")
+        self.thread_held = True
+        try:
+            path = self.transport.runtime_dir / "exec.lock"
+            self.handle = open(path, "a+b")
+            with contextlib.suppress(OSError):
+                os.chmod(path, 0o600)
+            if _fcntl is not None:
+                self._wait_locked(lambda: _fcntl.flock(self.handle.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB),
+                                  BlockingIOError, deadline)
+            elif _msvcrt is not None:  # pragma: no cover - Windows
+                self.handle.seek(0)
+                if self.handle.read(1) == b"":
+                    self.handle.write(b"0")
+                    self.handle.flush()
+
+                def _try_lock():
+                    self.handle.seek(0)
+                    getattr(_msvcrt, "locking")(self.handle.fileno(), getattr(_msvcrt, "LK_NBLCK"), 1)
+                self._wait_locked(_try_lock, OSError, deadline)
+        except Exception:
+            self.release()
+            raise
+
+    def release(self) -> None:
+        if self.handle is not None:
+            with contextlib.suppress(OSError):
+                if _fcntl is not None:
+                    _fcntl.flock(self.handle.fileno(), _fcntl.LOCK_UN)
+                elif _msvcrt is not None:  # pragma: no cover - Windows
+                    self.handle.seek(0)
+                    getattr(_msvcrt, "locking")(self.handle.fileno(), getattr(_msvcrt, "LK_UNLCK"), 1)
+            with contextlib.suppress(OSError):
+                self.handle.close()
+            self.handle = None
+        if self.thread_held:
+            self.thread_held = False
+            self.transport.thread_lock.release()
+
+
+def _probe_daemon_pid(runtime_dir: Path) -> Optional[int]:
+    """Return the live harness daemon PID after an authenticated IPC ping (``bu.sock`` / ``bu.port``)."""
+    connection: Optional[socket.socket] = None
+    try:
+        request: Dict[str, Any] = {"meta": "ping"}
+        if os.name == "nt":
+            payload = json.loads((runtime_dir / "bu.port").read_text(encoding="utf-8"))
+            port, token = int(payload["port"]), str(payload["token"])
+            if not token:
+                return None
+            request["token"] = token
+            connection = socket.create_connection(("127.0.0.1", port), timeout=1.0)
+        else:
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.settimeout(1.0)
+            connection.connect(str(runtime_dir / "bu.sock"))
+        connection.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        raw = b""
+        while not raw.endswith(b"\n") and len(raw) <= 65536:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            raw += chunk
+        response = json.loads(raw or b"{}")
+        if not isinstance(response, dict) or response.get("pong") is not True:
+            return None
+        pid = response.get("pid")
+        return pid if type(pid) is int and 0 < pid < (1 << 31) else None
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    finally:
+        if connection is not None:
+            with contextlib.suppress(OSError):
+                connection.close()
+
+
+def _daemon_identity(runtime_dir: Path) -> Optional[str]:
+    """Content-free identity of the live daemon (``bu.pid`` must match a live ping), or None."""
+    try:
+        path = runtime_dir / "bu.pid"
+        recorded_pid = int(path.read_text(encoding="utf-8").strip())
+        live_pid = _probe_daemon_pid(runtime_dir)
+        if live_pid is None or live_pid != recorded_pid:
+            return None
+        return hashlib.sha256(f"{live_pid}:{path.stat().st_mtime_ns}".encode()).hexdigest()[:20]
+    except (OSError, ValueError):
+        return None
+
+
+def _record_transport_outcome(transport: _SessionTransport, before: Optional[str], after: Optional[str],
+                              logical_session: str, success: bool, error_text: str) -> Dict[str, Any]:
+    """Local content-free attach telemetry; never records endpoint or raw IDs."""
+    path = transport.tmp_dir / "transport-telemetry.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("schema_version") != 1:
+            raise ValueError("old schema")
+    except (OSError, ValueError, AttributeError):
+        data = {"schema_version": 1, "attach_attempts": 0, "attach_successes": 0, "reuses": 0, "drops": 0,
+                "events": []}
+    attached = reused = False
+    event, reason = "unknown", ""
+    lowered_error = error_text.lower()
+    permission_failed = "permission-blocked" in lowered_error or "allow remote debugging" in lowered_error
+    if before and after == before:
+        data["reuses"] += 1
+        reused, event = True, "reuse"
+    elif after and after != before:
+        data["attach_attempts"] += 1
+        data["attach_successes"] += 1
+        attached, event = True, "attach_success"
+        reason = "cold_start" if before is None else "daemon_replaced"
+        if before is not None:
+            data["drops"] += 1
+    elif permission_failed:
+        data["attach_attempts"] += 1
+        attached, event, reason = True, "attach_failed", "permission_blocked"
+        if before is not None:
+            data["drops"] += 1
+    elif before and after is None:
+        data["drops"] += 1
+        event, reason = "drop_detected", "daemon_exited"
+    events = data.get("events", [])
+    events.append({"at_unix_ms": int(time.time() * 1000), "event": event, "reason": reason,
+                   "outcome": "success" if success else "error"})
+    data["events"] = events[-100:]
+    data["logical_session_hash"] = hashlib.sha256((logical_session or "default").encode()).hexdigest()[:16]
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temp.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp.unlink()
+    return {
+        "scope": "conversation_lineage", "transport_key": transport.key,
+        "attach_count": data["attach_attempts"], "attach_success_count": data["attach_successes"],
+        "attached_this_call": 1 if attached else 0, "reuse_count": data["reuses"], "reused": reused,
+        "drop_count": data["drops"],
+    }
 
 
 def _quiet(fn: Callable[[], Any], default: Any, log_prefix: str = "") -> Any:
@@ -601,7 +842,8 @@ def _validate_lease(lease_minutes: Any, lease_reason: Any) -> Tuple[int, str, Op
 
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  lease_minutes: int = 0, lease_reason: str = "",
-                 task_id: Optional[str] = None, local: bool = False, turn_id: Optional[str] = None):
+                 task_id: Optional[str] = None, local: bool = False, turn_id: Optional[str] = None,
+                 conversation_id: Optional[str] = None):
     """Run Python code through the browser-use CLI, and return its output"""
     from tools.registry import tool_error, tool_result
     if not code or not code.strip():
@@ -635,6 +877,9 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
     # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
+    transport = _configure_session_transport(env, conversation_id=str(conversation_id or ""),
+                                             logical_session=session or "default",
+                                             private_browser=bool(private_browser))
 
     workspace = _workspace_dir(task_id)
     if workspace:
@@ -665,22 +910,46 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
 
     if hygiene_guard is not None and hygiene_guard.target_id:
         code = f"switch_tab({json.dumps(hygiene_guard.target_id)})\n" + code
-    elif session and not private_browser:
+    elif not private_browser and (session or transport is not None):
         code = _OWN_TAB_PREAMBLE + code
 
     started = time.time()
     proc = None
     execution_error = None
+    hygiene_report = None
+    transport_telemetry = None
+    before_daemon = None
+    execution_lock = _TransportExecutionLock(transport, min(60, timeout)) if transport is not None else None
+    lock_held = False
     try:
+        if execution_lock is not None and transport is not None:
+            execution_lock.acquire()
+            lock_held = True
+            before_daemon = _daemon_identity(transport.runtime_dir)
         proc = _run_cli_killing_process_group(cmd, code, env, timeout)
     except subprocess.TimeoutExpired:
         execution_error = (f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
                            f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
                            "append to workspace files — anything already written to the workspace is preserved.")
+    except TimeoutError as e:
+        execution_error = f"Browser CDP transport is busy: {e}"
     except OSError as e:
         execution_error = f"Failed to launch browser-use CLI: {e}"
     finally:
-        hygiene_report = hygiene_guard.finish() if hygiene_guard is not None else None
+        try:
+            hygiene_report = hygiene_guard.finish() if hygiene_guard is not None else None
+        finally:
+            if transport is not None and lock_held:
+                try:
+                    transport_telemetry = _record_transport_outcome(
+                        transport, before_daemon, _daemon_identity(transport.runtime_dir), session or "default",
+                        execution_error is None and proc is not None and proc.returncode == 0,
+                        execution_error or ((proc.stderr or "") if proc is not None else ""),
+                    )
+                except Exception:
+                    logger.debug("browser CDP telemetry failed", exc_info=True)
+            if lock_held and execution_lock is not None:
+                execution_lock.release()
 
     if execution_error:
         if hygiene_report and not hygiene_report.get("ok", True):
@@ -693,6 +962,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         result["workspace"] = workspace
     if session:
         result["session"] = session
+    if transport_telemetry is not None:
+        result["cdp_transport"] = transport_telemetry
     if hygiene_report is not None:
         result["hygiene"] = hygiene_report
         if not hygiene_report.get("ok", False):
@@ -813,7 +1084,11 @@ BROWSER_EXEC_SCHEMA = {
         "type": "object",
         "properties": {
             "code": {"type": "string", "description": "Python code to execute using the pre-imported browser helpers. Use print(...) for any data you need back."},
-            "session": {"type": "string", "description": "Named isolated browser session — its own daemon and (on cloud backends) own browser, so concurrent tasks don't share tabs. Reuse the same name on every related call; omit for the shared default session."},
+            "session": {"type": "string",
+                        "description": ("Named logical browser session. Related calls reuse its tab namespace; cloud "
+                                        "backends may also allocate a browser. Shared local/CDP calls multiplex one "
+                                        "persistent physical connection per Hermes conversation lineage, avoiding "
+                                        "Chrome re-prompts. Reuse the same name for related calls; omit for default.")},
             "timeout_s": {"type": "integer", "default": _DEFAULT_TIMEOUT_S,
                           "description": f"Max seconds to wait for the code to finish (default {_DEFAULT_TIMEOUT_S}, max {_MAX_TIMEOUT_S})."},
             "lease_minutes": {"type": "integer", "minimum": 0, "maximum": _MAX_LEASE_MINUTES, "default": 0,
@@ -842,6 +1117,7 @@ registry.register(
         timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S),
         lease_minutes=args.get("lease_minutes", 0), lease_reason=args.get("lease_reason", ""),
         task_id=kw.get("task_id"), local=bool(args.get("local", False)), turn_id=kw.get("turn_id"),
+        conversation_id=kw.get("conversation_id") or kw.get("session_id"),
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,
