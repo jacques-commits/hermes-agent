@@ -4,6 +4,7 @@
 (no I/O).
 """
 
+import contextlib
 import os
 import posixpath
 import re
@@ -371,7 +372,15 @@ class SearchMixin:
                 exit_code = 124
                 break
         if proc.poll() is None:
-            _kill_process_group_posix(proc)  # native lane is POSIX-only (gate above)
+            # Local patch (upstream #104696 / PR #104879): on macOS an rg that has
+            # exited but is not yet reaped makes getpgid raise ESRCH and killpg raise
+            # EPERM. A bare call here turned a finished bounded search into a tool
+            # error ("[Errno 3] No such process") and dropped the collected results.
+            try:
+                _kill_process_group_posix(proc)  # native lane is POSIX-only (gate above)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    proc.kill()
         proc.wait()
         drainer.join()
         proc.stdout.close()
